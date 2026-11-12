@@ -1,4 +1,3 @@
-%%writefile app.py
 # app.py - CSV/LOG/TXT対応版 Streamlit Webダッシュボード
 import re
 from datetime import datetime
