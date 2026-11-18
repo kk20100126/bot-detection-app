@@ -1,4 +1,4 @@
-# app.py - CSV/LOG/TXT対応版 Streamlit Webダッシュボード
+# app.py - マルチフォーマット対応・デバッグ表示付き Webダッシュボード
 import re
 from datetime import datetime
 import pandas as pd
@@ -12,7 +12,6 @@ st.set_page_config(
 st.title("🛡️ 決定木型 ボット・高度サイバー攻撃検知システム")
 st.caption("Zスコア / 二項分布 / HHI指数 / Byte分散 統合診断ダッシュボード")
 
-# サイドバーでCSVも許可する
 st.sidebar.header("操作パネル")
 uploaded_file = st.sidebar.file_uploader(
     "アクセスログ (.log / .txt / .csv) をアップロード",
@@ -20,17 +19,68 @@ uploaded_file = st.sidebar.file_uploader(
 )
 
 
-def parse_log_data(file):
-    """LOG / TXT / CSV（表形式 & テキスト形式）の自動判別パース処理"""
-    ip_logs = {}
+def extract_from_line(line):
+    """1行のテキストから、順番や記号の違いを吸収して各要素を個別に抽出する"""
+    # 1. IPアドレスを抽出（行のどこにあっても取得）
+    ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", line)
+    if not ip_match:
+        return None
+    ip = ip_match.group(1)
 
-    # 1. ヘッダー付きの構造化CSVファイルとしてパースを試みる
+    # 2. 日時を抽出（[ ] の有無や区切り文字の違いに対応）
+    dt = None
+    m_apache = re.search(r"(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2})", line)
+    m_iso = re.search(r"(\d{4}[-/]\d{2}[-/]\d{2}[T\s]\d{2}:\d{2}:\d{2})", line)
+
+    if m_apache:
+        try:
+            dt = datetime.strptime(m_apache.group(1), "%d/%b/%Y:%H:%M:%S")
+        except ValueError:
+            pass
+    elif m_iso:
+        raw_t = m_iso.group(1).replace("/", "-").replace("T", " ")
+        try:
+            dt = datetime.strptime(raw_t, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+
+    if not dt:
+        return None
+
+    # 3. HTTPメソッドとURLを抽出（引用符がなくても取得）
+    url_match = re.search(
+        r"\b(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)",
+        line,
+        re.IGNORECASE,
+    )
+    if url_match:
+        url = url_match.group(1)
+    else:
+        path_match = re.search(r"\s(/\S*)", line)
+        url = path_match.group(1) if path_match else "/"
+
+    # 4. ステータスコードとバイト数を抽出（バイト数省略ログにも対応）
+    sb_match = re.search(r'\s([1-5]\d{2})(?:\s+(\d+|-))?(?:\s|"|$)', line)
+    if sb_match:
+        status = int(sb_match.group(1))
+        b_raw = sb_match.group(2)
+        b_val = int(b_raw) if (b_raw and b_raw.isdigit()) else 0
+    else:
+        status = 200
+        b_val = 0
+
+    return ip, dt, status, url, b_val
+
+
+def parse_log_data(file):
+    """LOG / TXT / CSV の自動判別パース処理"""
+    ip_logs = {}
+    failed_samples = []
+
+    # 1. 表形式CSVとして読み込みを試行
     if file.name.endswith(".csv"):
         try:
             df = pd.read_csv(file)
-            col_map = {str(col).lower(): col for col in df.columns}
-
-            # 列名の表記ゆれを柔軟に検索
             ip_col = next((c for c in df.columns if "ip" in str(c).lower()), None)
             time_col = next(
                 (
@@ -61,106 +111,68 @@ def parse_log_data(file):
             )
 
             if ip_col and time_col:
-                for _, row in df.iterrows():
-                    ip = str(row[ip_col]).strip()
-                    time_raw = str(row[time_col]).strip()
+                df["parsed_dt"] = pd.to_datetime(df[time_col], errors="coerce")
+                valid_df = df.dropna(subset=["parsed_dt"])
 
-                    dt = None
-                    for fmt in (
-                        "%d/%b/%Y:%H:%M:%S",
-                        "%Y-%m-%dT%H:%M:%S",
-                        "%Y-%m-%d %H:%M:%S",
-                        "%Y/%m/%d %H:%M:%S",
-                    ):
-                        try:
-                            dt = datetime.strptime(time_raw.split(".")[0], fmt)
-                            break
-                        except ValueError:
-                            continue
-
-                    if dt:
-                        status = (
-                            int(row[status_col])
-                            if status_col and str(row[status_col]).isdigit()
-                            else 200
-                        )
-                        url = str(row[url_col]) if url_col else "/"
-                        raw_b = (
-                            row[bytes_col]
-                            if bytes_col and pd.notna(row[bytes_col])
-                            else 0
-                        )
-                        try:
-                            b_val = int(raw_b)
-                        except ValueError:
-                            b_val = 0
-
-                        ip_logs.setdefault(
-                            ip,
-                            {
-                                "timestamps": [],
-                                "statuses": [],
-                                "urls": [],
-                                "bytes": [],
-                            },
-                        )
-                        ip_logs[ip]["timestamps"].append(dt)
-                        ip_logs[ip]["statuses"].append(status)
-                        ip_logs[ip]["urls"].append(url)
-                        ip_logs[ip]["bytes"].append(b_val)
-
+                for ip, group in valid_df.groupby(ip_col):
+                    ip_str = str(ip).strip()
+                    ip_logs[ip_str] = {
+                        "timestamps": group["parsed_dt"].tolist(),
+                        "statuses": (
+                            group[status_col].fillna(200).astype(int).tolist()
+                            if status_col
+                            else [200] * len(group)
+                        ),
+                        "urls": (
+                            group[url_col].fillna("/").astype(str).tolist()
+                            if url_col
+                            else ["/"] * len(group)
+                        ),
+                        "bytes": (
+                            group[bytes_col].fillna(0).astype(int).tolist()
+                            if bytes_col
+                            else [0] * len(group)
+                        ),
+                    }
                 if ip_logs:
-                    return ip_logs
+                    return ip_logs, failed_samples
         except Exception:
-            pass  # 表形式で失敗した場合はテキスト形式パースへ進む
+            pass
 
-    # 2. テキスト形式（.log, .txt, 単一文字列型.csv）の正規表現パース
+    # 2. テキスト形式（.log / .txt / 単一列CSV）として1行ずつ抽出
     file.seek(0)
     log_text = file.getvalue().decode("utf-8", errors="ignore")
     lines = log_text.strip().split("\n")
 
-    pattern = r"(?P<ip>\d+\.\d+\.\d+\.\d+).*?\[(?P<time>.*?)\] [\"'](?P<method>\w+)\s+(?P<url>\S+).*?[\"'] (?P<status>\d+) (?P<bytes>\d+|-)"
-
     for line in lines:
-        match = re.search(pattern, line)
-        if match:
-            ip = match.group("ip")
-            time_raw = match.group("time").split(" ")[0]
-            dt = None
-            for fmt in (
-                "%d/%b/%Y:%H:%M:%S",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y-%m-%d %H:%M:%S",
-                "%Y/%m/%d %H:%M:%S",
-            ):
-                try:
-                    dt = datetime.strptime(time_raw, fmt)
-                    break
-                except ValueError:
-                    continue
-            if dt:
-                raw_bytes = match.group("bytes")
-                ip_logs.setdefault(
-                    ip,
-                    {"timestamps": [], "statuses": [], "urls": [], "bytes": []},
-                )
-                ip_logs[ip]["timestamps"].append(dt)
-                ip_logs[ip]["statuses"].append(int(match.group("status")))
-                ip_logs[ip]["urls"].append(match.group("url"))
-                ip_logs[ip]["bytes"].append(
-                    int(raw_bytes) if raw_bytes.isdigit() else 0
-                )
+        if not line.strip():
+            continue
+        parsed = extract_from_line(line)
+        if parsed:
+            ip, dt, status, url, b_val = parsed
+            ip_logs.setdefault(
+                ip, {"timestamps": [], "statuses": [], "urls": [], "bytes": []}
+            )
+            ip_logs[ip]["timestamps"].append(dt)
+            ip_logs[ip]["statuses"].append(status)
+            ip_logs[ip]["urls"].append(url)
+            ip_logs[ip]["bytes"].append(b_val)
+        else:
+            if len(failed_samples) < 3:
+                failed_samples.append(line.strip())
 
-    return ip_logs
+    return ip_logs, failed_samples
 
 
 if uploaded_file is not None:
-    ip_logs = parse_log_data(uploaded_file)
+    ip_logs, failed_samples = parse_log_data(uploaded_file)
 
     if not ip_logs:
-        st.error(
-            "⚠️ ログ解析に失敗しました。ファイル内のIPアドレスや日時の記述形式を確認してください。"
-        )
+        st.error("⚠️ ログ解析に失敗しました。対応していない書式です。")
+        if failed_samples:
+            st.warning("▼ 読み込めなかった行のサンプル（最初の3行）：")
+            for sample in failed_samples:
+                st.code(sample, language="text")
     else:
         results = [evaluate_ip(ip, data) for ip, data in ip_logs.items()]
         df_results = pd.DataFrame(results)
