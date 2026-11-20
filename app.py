@@ -19,8 +19,6 @@ uploaded_file = st.sidebar.file_uploader(
     type=["log", "txt", "csv","json"],
 )
 
-data = json.load(file)
-
 def parse_zeek_log(lines):
     """Zeek (旧Bro) 形式のログ（#fields ヘッダー・タブ区切り・UNIX時間）をパースする"""
     ip_logs = {}
@@ -81,6 +79,10 @@ def parse_zeek_log(lines):
 
     return ip_logs
 
+def parse_json_log(file):
+    ip_logs = {}
+    data = json.load(file)
+    return ip_logs
 
 def extract_from_web_line(line):
     """通常のWebアクセスログ1行から各要素を抽出する"""
