@@ -80,6 +80,9 @@ def extract_json_record(item, ip_logs):
             dt = datetime.fromtimestamp(ts_val)
         else:
             dt = pd.to_datetime(raw_time).to_pydatetime()
+        if dt.tzinfo is not None:
+        dt = dt.replace(tzinfo=None)
+        
     except Exception:
         return
 
