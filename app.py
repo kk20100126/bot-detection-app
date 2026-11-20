@@ -1,4 +1,3 @@
-%%writefile app.py
 # app.py - Zeek(conn.log) / Webログ / CSV マルチフォーマット対応版
 import re
 from datetime import datetime
