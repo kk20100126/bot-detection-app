@@ -1,9 +1,11 @@
-# app.py - マルチフォーマット対応・デバッグ表示付き Webダッシュボード
+%%writefile app.py
+# app.py - Zeek(conn.log) / Webログ / CSV マルチフォーマット対応版
 import re
 from datetime import datetime
 import pandas as pd
 import streamlit as st
 from tree_engine import evaluate_ip
+import json
 
 st.set_page_config(
     page_title="Bot Detection System", page_icon="🛡️", layout="wide"
@@ -14,20 +16,80 @@ st.caption("Zスコア / 二項分布 / HHI指数 / Byte分散 統合診断ダ�
 
 st.sidebar.header("操作パネル")
 uploaded_file = st.sidebar.file_uploader(
-    "アクセスログ (.log / .txt / .csv) をアップロード",
-    type=["log", "txt", "csv"],
+    "アクセスログ (.log / .txt / .csv / .json) をアップロード",
+    type=["log", "txt", "csv","json"],
 )
 
+data = json.load(file)
 
-def extract_from_line(line):
-    """1行のテキストから、順番や記号の違いを吸収して各要素を個別に抽出する"""
-    # 1. IPアドレスを抽出（行のどこにあっても取得）
+def parse_zeek_log(lines):
+    """Zeek (旧Bro) 形式のログ（#fields ヘッダー・タブ区切り・UNIX時間）をパースする"""
+    ip_logs = {}
+    fields = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        # #fields 行から列名リストを取得
+        if line.startswith("#fields"):
+            fields = line.split("\t")[1:]
+            continue
+
+        # その他の # で始まるメタデータ行はスキップ
+        if line.startswith("#") or not fields:
+            continue
+
+        cols = line.split("\t")
+        if len(cols) < len(fields):
+            continue
+
+        row = dict(zip(fields, cols))
+
+        # 1. UNIX時間を datetime に変換
+        try:
+            dt = datetime.fromtimestamp(float(row.get("ts", 0)))
+        except ValueError:
+            continue
+
+        # 2. 送信元IP（IPv4 / IPv6 両対応）
+        ip = row.get("id.orig_h", "").strip()
+        if not ip or ip == "-":
+            continue
+
+        # 3. 接続先IP:ポート を URL の代わりとして HHI 計算に利用
+        resp_h = row.get("id.resp_h", "-")
+        resp_p = row.get("id.resp_p", "-")
+        target = f"{resp_h}:{resp_p}"
+
+        # 4. 接続状態 (conn_state) をステータスコードに読み替え
+        conn_state = row.get("conn_state", "SF")
+        failed_states = {"S0", "REJ", "RSTO", "RSTR", "RSTOS0", "RSTRH"}
+        status = 400 if conn_state in failed_states else 200
+
+        # 5. バイト数の取得（'-' の場合は 0 に変換）
+        raw_bytes = row.get("resp_ip_bytes", row.get("resp_bytes", "0"))
+        b_val = int(raw_bytes) if raw_bytes.isdigit() else 0
+
+        ip_logs.setdefault(
+            ip, {"timestamps": [], "statuses": [], "urls": [], "bytes": []}
+        )
+        ip_logs[ip]["timestamps"].append(dt)
+        ip_logs[ip]["statuses"].append(status)
+        ip_logs[ip]["urls"].append(target)
+        ip_logs[ip]["bytes"].append(b_val)
+
+    return ip_logs
+
+
+def extract_from_web_line(line):
+    """通常のWebアクセスログ1行から各要素を抽出する"""
     ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", line)
     if not ip_match:
         return None
     ip = ip_match.group(1)
 
-    # 2. 日時を抽出（[ ] の有無や区切り文字の違いに対応）
     dt = None
     m_apache = re.search(r"(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2})", line)
     m_iso = re.search(r"(\d{4}[-/]\d{2}[-/]\d{2}[T\s]\d{2}:\d{2}:\d{2})", line)
@@ -47,7 +109,6 @@ def extract_from_line(line):
     if not dt:
         return None
 
-    # 3. HTTPメソッドとURLを抽出（引用符がなくても取得）
     url_match = re.search(
         r"\b(?:GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH)\s+(\S+)",
         line,
@@ -59,7 +120,6 @@ def extract_from_line(line):
         path_match = re.search(r"\s(/\S*)", line)
         url = path_match.group(1) if path_match else "/"
 
-    # 4. ステータスコードとバイト数を抽出（バイト数省略ログにも対応）
     sb_match = re.search(r'\s([1-5]\d{2})(?:\s+(\d+|-))?(?:\s|"|$)', line)
     if sb_match:
         status = int(sb_match.group(1))
@@ -73,7 +133,7 @@ def extract_from_line(line):
 
 
 def parse_log_data(file):
-    """LOG / TXT / CSV の自動判別パース処理"""
+    """LOG / TXT / CSV / Zeekログ の自動判別パース処理"""
     ip_logs = {}
     failed_samples = []
 
@@ -139,15 +199,21 @@ def parse_log_data(file):
         except Exception:
             pass
 
-    # 2. テキスト形式（.log / .txt / 単一列CSV）として1行ずつ抽出
+    # テキストとして読み込み
     file.seek(0)
     log_text = file.getvalue().decode("utf-8", errors="ignore")
     lines = log_text.strip().split("\n")
 
+    # 2. Zeek形式（#fields または #separator を含む）の自動判別
+    if any(line.startswith("#fields") for line in lines[:20]):
+        ip_logs = parse_zeek_log(lines)
+        return ip_logs, failed_samples
+
+    # 3. 通常のWebアクセスログ形式として1行ずつ抽出
     for line in lines:
         if not line.strip():
             continue
-        parsed = extract_from_line(line)
+        parsed = extract_from_web_line(line)
         if parsed:
             ip, dt, status, url, b_val = parsed
             ip_logs.setdefault(
