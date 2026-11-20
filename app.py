@@ -1,10 +1,11 @@
-# app.py - Zeek(conn.log) / Webログ / CSV マルチフォーマット対応版
+%%writefile app.py
+# app.py - JSON / Zeek(conn.log) / Webログ / CSV マルチフォーマット対応版
+import json
 import re
 from datetime import datetime
 import pandas as pd
 import streamlit as st
 from tree_engine import evaluate_ip
-import json
 
 st.set_page_config(
     page_title="Bot Detection System", page_icon="🛡️", layout="wide"
@@ -16,11 +17,81 @@ st.caption("Zスコア / 二項分布 / HHI指数 / Byte分散 統合診断ダ�
 st.sidebar.header("操作パネル")
 uploaded_file = st.sidebar.file_uploader(
     "アクセスログ (.log / .txt / .csv / .json) をアップロード",
-    type=["log", "txt", "csv","json"],
+    type=["log", "txt", "csv", "json"],
 )
 
+
+def parse_json_log(file):
+    """JSON形式（配列形式 / 1行1JSON形式）をパースする"""
+    ip_logs = {}
+    raw_text = file.getvalue().decode("utf-8", errors="ignore").strip()
+    if not raw_text:
+        return ip_logs
+
+    # 通常のJSON配列か、1行ずつのJSON(JSONL)かを自動判別して読み込み
+    try:
+        data = json.loads(raw_text)
+        if isinstance(data, dict):
+            data = [data]
+    except json.JSONDecodeError:
+        data = []
+        for line in raw_text.split("\n"):
+            if line.strip():
+                try:
+                    data.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+
+        ip = item.get("ip") or item.get("id.orig_h")
+        if not ip:
+            continue
+
+        raw_time = item.get("timestamp") or item.get("ts")
+        if not raw_time:
+            continue
+        try:
+            if isinstance(raw_time, (int, float)) or str(raw_time).replace(
+                ".", "", 1
+            ).isdigit():
+                dt = datetime.fromtimestamp(float(raw_time))
+            else:
+                dt = pd.to_datetime(raw_time).to_pydatetime()
+        except Exception:
+            continue
+
+        # URL（Zeek由来の場合は接続先IP:ポートで代用）
+        if "url" in item:
+            url = str(item["url"])
+        elif "id.resp_h" in item:
+            url = f"{item.get('id.resp_h', '-')}:{item.get('id.resp_p', '-')}"
+        else:
+            url = "/"
+
+        # ステータスコード
+        raw_status = item.get("status", 200)
+        status = int(raw_status) if str(raw_status).isdigit() else 200
+
+        # バイト数
+        raw_bytes = item.get("bytes", item.get("resp_ip_bytes", 0))
+        b_val = int(raw_bytes) if str(raw_bytes).isdigit() else 0
+
+        ip_logs.setdefault(
+            str(ip), {"timestamps": [], "statuses": [], "urls": [], "bytes": []}
+        )
+        ip_logs[str(ip)]["timestamps"].append(dt)
+        ip_logs[str(ip)]["statuses"].append(status)
+        ip_logs[str(ip)]["urls"].append(url)
+        ip_logs[str(ip)]["bytes"].append(b_val)
+
+    return ip_logs
+
+
 def parse_zeek_log(lines):
-    """Zeek (旧Bro) 形式のログ（#fields ヘッダー・タブ区切り・UNIX時間）をパースする"""
+    """Zeek (旧Bro) 形式のログをパースする"""
     ip_logs = {}
     fields = []
 
@@ -28,13 +99,9 @@ def parse_zeek_log(lines):
         line = line.strip()
         if not line:
             continue
-
-        # #fields 行から列名リストを取得
         if line.startswith("#fields"):
             fields = line.split("\t")[1:]
             continue
-
-        # その他の # で始まるメタデータ行はスキップ
         if line.startswith("#") or not fields:
             continue
 
@@ -43,29 +110,23 @@ def parse_zeek_log(lines):
             continue
 
         row = dict(zip(fields, cols))
-
-        # 1. UNIX時間を datetime に変換
         try:
             dt = datetime.fromtimestamp(float(row.get("ts", 0)))
         except ValueError:
             continue
 
-        # 2. 送信元IP（IPv4 / IPv6 両対応）
         ip = row.get("id.orig_h", "").strip()
         if not ip or ip == "-":
             continue
 
-        # 3. 接続先IP:ポート を URL の代わりとして HHI 計算に利用
         resp_h = row.get("id.resp_h", "-")
         resp_p = row.get("id.resp_p", "-")
         target = f"{resp_h}:{resp_p}"
 
-        # 4. 接続状態 (conn_state) をステータスコードに読み替え
         conn_state = row.get("conn_state", "SF")
         failed_states = {"S0", "REJ", "RSTO", "RSTR", "RSTOS0", "RSTRH"}
         status = 400 if conn_state in failed_states else 200
 
-        # 5. バイト数の取得（'-' の場合は 0 に変換）
         raw_bytes = row.get("resp_ip_bytes", row.get("resp_bytes", "0"))
         b_val = int(raw_bytes) if raw_bytes.isdigit() else 0
 
@@ -79,10 +140,6 @@ def parse_zeek_log(lines):
 
     return ip_logs
 
-def parse_json_log(file):
-    ip_logs = {}
-    data = json.load(file)
-    return ip_logs
 
 def extract_from_web_line(line):
     """通常のWebアクセスログ1行から各要素を抽出する"""
@@ -134,11 +191,16 @@ def extract_from_web_line(line):
 
 
 def parse_log_data(file):
-    """LOG / TXT / CSV / Zeekログ の自動判別パース処理"""
+    """LOG / TXT / CSV / JSON / Zeekログ の自動判別パース処理"""
     ip_logs = {}
     failed_samples = []
 
-    # 1. 表形式CSVとして読み込みを試行
+    # 1. JSON形式
+    if file.name.endswith(".json"):
+        ip_logs = parse_json_log(file)
+        return ip_logs, failed_samples
+
+    # 2. 表形式CSVとして読み込みを試行
     if file.name.endswith(".csv"):
         try:
             df = pd.read_csv(file)
@@ -200,17 +262,16 @@ def parse_log_data(file):
         except Exception:
             pass
 
-    # テキストとして読み込み
     file.seek(0)
     log_text = file.getvalue().decode("utf-8", errors="ignore")
     lines = log_text.strip().split("\n")
 
-    # 2. Zeek形式（#fields または #separator を含む）の自動判別
+    # 3. Zeek形式
     if any(line.startswith("#fields") for line in lines[:20]):
         ip_logs = parse_zeek_log(lines)
         return ip_logs, failed_samples
 
-    # 3. 通常のWebアクセスログ形式として1行ずつ抽出
+    # 4. 通常のWebアクセスログ形式
     for line in lines:
         if not line.strip():
             continue
@@ -282,5 +343,5 @@ if uploaded_file is not None:
         )
 else:
     st.info(
-        "👈 左側のサイドバーからアクセスログファイル（.log / .txt / .csv）を選んでアップロードしてください。"
+        "👈 左側のサイドバーからアクセスログファイル（.log / .txt / .csv / .json）を選んでアップロードしてください。"
     )
