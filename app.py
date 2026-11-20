@@ -1,4 +1,4 @@
-# app.py - JSON / Zeek(conn.log) / Webログ / CSV マルチフォーマット対応版
+# app.py - 省メモリ・ストリーミング読み込み & Honeypot JSON対応版
 import json
 import re
 from datetime import datetime
@@ -18,84 +18,160 @@ uploaded_file = st.sidebar.file_uploader(
     "アクセスログ (.log / .txt / .csv / .json) をアップロード",
     type=["log", "txt", "csv", "json"],
 )
+max_lines = st.sidebar.number_input(
+    "最大読み込み行数（メモリ保護用）",
+    min_value=1000,
+    max_value=500000,
+    value=100000,
+    step=10000,
+)
 
 
-def parse_json_log(file):
-    """JSON形式（配列形式 / 1行1JSON形式）をパースする"""
+def extract_json_record(item, ip_logs):
+    """1件のJSON辞書からIP・日時・URL・ステータス・バイト数を抽出して追加する"""
+    if not isinstance(item, dict):
+        return
+
+    # payload が入れ子（文字列または辞書）になっている場合は中身を展開して統合
+    merged = dict(item)
+    payload = item.get("payload")
+    if isinstance(payload, str):
+        try:
+            parsed_payload = json.loads(payload)
+            if isinstance(parsed_payload, dict):
+                merged.update(parsed_payload)
+        except json.JSONDecodeError:
+            pass
+    elif isinstance(payload, dict):
+        merged.update(payload)
+
+    # 1. IPアドレス（Webログ / Honeypot / Zeek の各種キーに対応）
+    ip = (
+        merged.get("ip")
+        or merged.get("src_ip")
+        or merged.get("peerIP")
+        or merged.get("attackerIP")
+        or merged.get("remote_ip")
+        or merged.get("id.orig_h")
+    )
+    if not ip:
+        return
+    ip = str(ip).strip()
+
+    # 2. 日時（{"$date": "..."} 形式・UNIX秒・ミリ秒・ISO文字列に対応）
+    raw_time = (
+        merged.get("timestamp")
+        or merged.get("ts")
+        or merged.get("@timestamp")
+        or merged.get("time")
+    )
+    if isinstance(raw_time, dict):
+        raw_time = raw_time.get("$date")
+    if not raw_time:
+        return
+
+    try:
+        if isinstance(raw_time, (int, float)) or str(raw_time).replace(
+            ".", "", 1
+        ).isdigit():
+            ts_val = float(raw_time)
+            if ts_val > 1e11:  # ミリ秒単位の場合は秒に変換
+                ts_val /= 1000.0
+            dt = datetime.fromtimestamp(ts_val)
+        else:
+            dt = pd.to_datetime(raw_time).to_pydatetime()
+    except Exception:
+        return
+
+    # 3. URL / アクセス対象（URLがない場合はイベント名や宛先ポートで代用）
+    if merged.get("url"):
+        url = str(merged["url"])
+    elif merged.get("request_url"):
+        url = str(merged["request_url"])
+    elif merged.get("path"):
+        url = str(merged["path"])
+    elif merged.get("eventid"):
+        url = str(merged["eventid"])
+    elif merged.get("id.resp_h"):
+        url = f"{merged.get('id.resp_h')}:{merged.get('id.resp_p', '-')}"
+    elif merged.get("dst_port") or merged.get("hostPort"):
+        url = f"port:{merged.get('dst_port') or merged.get('hostPort')}"
+    else:
+        url = "/"
+
+    # 4. ステータスコード（ログイン失敗などのイベントは400扱いに変換）
+    raw_status = merged.get("status") or merged.get("status_code")
+    if raw_status is not None and str(raw_status).isdigit():
+        status = int(raw_status)
+    elif any(
+        k in str(merged.get("eventid", "")).lower()
+        for k in ["failed", "error", "closed"]
+    ):
+        status = 400
+    else:
+        status = 200
+
+    # 5. バイト数
+    raw_bytes = (
+        merged.get("bytes")
+        or merged.get("resp_ip_bytes")
+        or merged.get("size")
+        or 0
+    )
+    b_val = int(raw_bytes) if str(raw_bytes).isdigit() else 0
+
+    ip_logs.setdefault(
+        ip, {"timestamps": [], "statuses": [], "urls": [], "bytes": []}
+    )
+    ip_logs[ip]["timestamps"].append(dt)
+    ip_logs[ip]["statuses"].append(status)
+    ip_logs[ip]["urls"].append(url)
+    ip_logs[ip]["bytes"].append(b_val)
+
+
+def parse_json_log(file, limit):
+    """JSONファイルを1行ずつストリーミング読み込み（省メモリ版）"""
     ip_logs = {}
-    raw_text = file.getvalue().decode("utf-8", errors="ignore").strip()
-    if not raw_text:
+    file.seek(0)
+    head = file.read(512).decode("utf-8", errors="ignore").lstrip()
+    file.seek(0)
+
+    # 配列形式 ([{...}, {...}]) の場合
+    if head.startswith("["):
+        try:
+            data = json.load(file)
+            for item in data[:limit]:
+                extract_json_record(item, ip_logs)
+        except Exception:
+            pass
         return ip_logs
 
-    # 通常のJSON配列か、1行ずつのJSON(JSONL)かを自動判別して読み込み
-    try:
-        data = json.loads(raw_text)
-        if isinstance(data, dict):
-            data = [data]
-    except json.JSONDecodeError:
-        data = []
-        for line in raw_text.split("\n"):
-            if line.strip():
-                try:
-                    data.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
-
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-
-        ip = item.get("ip") or item.get("id.orig_h")
-        if not ip:
-            continue
-
-        raw_time = item.get("timestamp") or item.get("ts")
-        if not raw_time:
+    # 1行1JSON形式 (JSON Lines / honeypot.json) の場合：全量をメモリに載せず1行ずつ処理
+    for idx, raw_line in enumerate(file):
+        if idx >= limit:
+            break
+        line = raw_line.decode("utf-8", errors="ignore").strip()
+        if not line:
             continue
         try:
-            if isinstance(raw_time, (int, float)) or str(raw_time).replace(
-                ".", "", 1
-            ).isdigit():
-                dt = datetime.fromtimestamp(float(raw_time))
-            else:
-                dt = pd.to_datetime(raw_time).to_pydatetime()
-        except Exception:
+            item = json.loads(line)
+            extract_json_record(item, ip_logs)
+        except json.JSONDecodeError:
             continue
-
-        # URL（Zeek由来の場合は接続先IP:ポートで代用）
-        if "url" in item:
-            url = str(item["url"])
-        elif "id.resp_h" in item:
-            url = f"{item.get('id.resp_h', '-')}:{item.get('id.resp_p', '-')}"
-        else:
-            url = "/"
-
-        # ステータスコード
-        raw_status = item.get("status", 200)
-        status = int(raw_status) if str(raw_status).isdigit() else 200
-
-        # バイト数
-        raw_bytes = item.get("bytes", item.get("resp_ip_bytes", 0))
-        b_val = int(raw_bytes) if str(raw_bytes).isdigit() else 0
-
-        ip_logs.setdefault(
-            str(ip), {"timestamps": [], "statuses": [], "urls": [], "bytes": []}
-        )
-        ip_logs[str(ip)]["timestamps"].append(dt)
-        ip_logs[str(ip)]["statuses"].append(status)
-        ip_logs[str(ip)]["urls"].append(url)
-        ip_logs[str(ip)]["bytes"].append(b_val)
 
     return ip_logs
 
 
-def parse_zeek_log(lines):
-    """Zeek (旧Bro) 形式のログをパースする"""
+def parse_zeek_log(file, limit):
+    """Zeek (旧Bro) 形式のログを1行ずつパースする"""
     ip_logs = {}
     fields = []
+    file.seek(0)
 
-    for line in lines:
-        line = line.strip()
+    for idx, raw_line in enumerate(file):
+        if idx >= limit:
+            break
+        line = raw_line.decode("utf-8", errors="ignore").strip()
         if not line:
             continue
         if line.startswith("#fields"):
@@ -189,20 +265,18 @@ def extract_from_web_line(line):
     return ip, dt, status, url, b_val
 
 
-def parse_log_data(file):
+def parse_log_data(file, limit):
     """LOG / TXT / CSV / JSON / Zeekログ の自動判別パース処理"""
     ip_logs = {}
     failed_samples = []
 
-    # 1. JSON形式
     if file.name.endswith(".json"):
-        ip_logs = parse_json_log(file)
+        ip_logs = parse_json_log(file, limit)
         return ip_logs, failed_samples
 
-    # 2. 表形式CSVとして読み込みを試行
     if file.name.endswith(".csv"):
         try:
-            df = pd.read_csv(file)
+            df = pd.read_csv(file, nrows=limit)
             ip_col = next((c for c in df.columns if "ip" in str(c).lower()), None)
             time_col = next(
                 (
@@ -262,17 +336,19 @@ def parse_log_data(file):
             pass
 
     file.seek(0)
-    log_text = file.getvalue().decode("utf-8", errors="ignore")
-    lines = log_text.strip().split("\n")
-
-    # 3. Zeek形式
-    if any(line.startswith("#fields") for line in lines[:20]):
-        ip_logs = parse_zeek_log(lines)
+    head_lines = [
+        file.readline().decode("utf-8", errors="ignore") for _ in range(20)
+    ]
+    if any(line.startswith("#fields") for line in head_lines):
+        ip_logs = parse_zeek_log(file, limit)
         return ip_logs, failed_samples
 
-    # 4. 通常のWebアクセスログ形式
-    for line in lines:
-        if not line.strip():
+    file.seek(0)
+    for idx, raw_line in enumerate(file):
+        if idx >= limit:
+            break
+        line = raw_line.decode("utf-8", errors="ignore").strip()
+        if not line:
             continue
         parsed = extract_from_web_line(line)
         if parsed:
@@ -286,13 +362,13 @@ def parse_log_data(file):
             ip_logs[ip]["bytes"].append(b_val)
         else:
             if len(failed_samples) < 3:
-                failed_samples.append(line.strip())
+                failed_samples.append(line)
 
     return ip_logs, failed_samples
 
 
 if uploaded_file is not None:
-    ip_logs, failed_samples = parse_log_data(uploaded_file)
+    ip_logs, failed_samples = parse_log_data(uploaded_file, max_lines)
 
     if not ip_logs:
         st.error("⚠️ ログ解析に失敗しました。対応していない書式です。")
