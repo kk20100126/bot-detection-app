@@ -1,4 +1,3 @@
-%%writefile app.py
 # app.py - JSON / Zeek(conn.log) / Webログ / CSV マルチフォーマット対応版
 import json
 import re
